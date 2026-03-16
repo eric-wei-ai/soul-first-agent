@@ -1,137 +1,412 @@
-# Multi-Session Concurrent Operations
+# Multi-Agent Session Concurrency: Conflict-Free Design
 
-When you deploy an AI employee that handles both direct messages and group chats, you are running multiple independent sessions against a shared filesystem. This document covers the coordination patterns that prevent data corruption and keep sessions aware of each other's work.
+> How to prevent race conditions when multiple AI agents share the same workspace and memory files.
 
-## The Problem
+---
 
-Each conversation with your AI employee spawns a separate session. A DM is one session. A group chat is another. Both sessions read and write to the same workspace directory — the same memory files, the same task lists, the same daily logs.
+## Table of Contents
 
-Without coordination, you get predictable failures:
+1. [Problem Description](#1-problem-description)
+2. [Root Cause Analysis](#2-root-cause-analysis)
+3. [Solution Overview](#3-solution-overview)
+4. [Solution 1 — File Locking](#4-solution-1--file-locking)
+5. [Solution 2 — Path Separation](#5-solution-2--path-separation)
+6. [Solution 3 — Role-Based Responsibility Split](#6-solution-3--role-based-responsibility-split)
+7. [Putting It Together](#7-putting-it-together)
+8. [Common Mistakes](#8-common-mistakes)
+9. [Quick Reference](#9-quick-reference)
 
-- Two sessions append to the same daily log at the same instant. One write overwrites the other.
-- A task gets picked up in a DM session, but the group chat session has no record of it. Someone asks "what's the status?" and the AI says "no active tasks."
-- Both sessions update `MEMORY.md` simultaneously. The file ends up with a corrupted merge of both writes.
+---
 
-This is not a theoretical risk. It happens reliably once more than one person interacts with the same AI employee, or once you start mixing DM task execution with group chat coordination.
+## 1. Problem Description
 
-## DM vs Group Chat Division of Labor
+In a multi-agent AI system, several agent sessions may run simultaneously. Each session processes incoming messages independently, yet they often share:
 
-The fix starts with a clear division: each session type has a primary responsibility.
+- A **common workspace directory** (e.g., `/workspace/`)
+- **Shared memory files** (e.g., `memory/MEMORY.md`, `memory/2026-03-15.md`)
+- **State files** and task logs
 
-**DM session** is the worker. It executes specific tasks — deep analysis, writing code, long-running operations. When someone needs something done, they assign it in a DM.
+When two agents try to write the same file at the same moment, a **race condition** occurs:
 
-**Group chat session** is the coordinator. It handles status updates, multi-person discussions, and quick Q&A. It reads from memory files to report on progress but does not execute heavy tasks.
-
-**Critical rule**: two sessions must NOT simultaneously write to core memory files without a locking mechanism.
-
-| Operation | DM Session | Group Session |
-|-----------|-----------|---------------|
-| Task execution | Primary | No |
-| Status reporting | No | Primary |
-| Daily log writes | Yes (task logs) | Yes (interaction logs) |
-| MEMORY.md updates | Yes (via file lock) | Yes (via file lock) |
-| Code/file creation | Yes | No |
-| Todo creation | Yes | Yes |
-
-This table is a convention, not a technical enforcement. The enforcement comes from file locking and path separation, covered next.
-
-## File Locking to Prevent Conflicts
-
-Any write to shared files MUST use a file lock. See [`tools/file_lock_write.py`](../tools/file_lock_write.py) for the implementation, or the detailed explanation in [Memory System](memory-system.md#file-locking).
+```
+Session A                        Session B
+─────────                        ─────────
+read("memory/today.md")          read("memory/today.md")
+  → "# 2026-03-15\n- Event A"     → "# 2026-03-15\n- Event A"
+append("- Event B")              append("- Event C")
+write(file)                      write(file)   ← overwrites A's write
 ```
 
-The rule is simple: ALL writes to `memory/*.md` files MUST go through this wrapper. Direct writes are prohibited.
+**Result**: Only "Event C" survives. "Event B" is silently lost.
+
+This is not a theoretical risk — it happens in production whenever:
+- A direct-message session and a group-chat session both update the daily log
+- Two parallel task agents both write their results to a shared file
+- An orchestrator and a sub-agent both update a shared state file
+
+---
+
+## 2. Root Cause Analysis
+
+### 2.1 Non-Atomic Read-Modify-Write
+
+The standard pattern `read → modify → write` is not atomic. Any other writer can interleave between these steps.
+
+### 2.2 No Built-in Coordination
+
+Each agent session runs in its own process or async context. Without an explicit coordination mechanism, there is no awareness of other writers.
+
+### 2.3 Shared Mutable State
+
+Shared memory files act as mutable global state. The more agents share a file, the higher the probability of collision.
+
+### 2.4 Silent Failures
+
+File overwrites do not raise exceptions. The losing agent successfully completes its write — it simply overwrites the winner's data with stale content.
+
+---
+
+## 3. Solution Overview
+
+Three complementary strategies, applied in layers:
+
+| Layer | Strategy | Best For |
+|-------|----------|----------|
+| L1 | **File Locking** | Serialize writes to any shared file |
+| L2 | **Path Separation** | Eliminate sharing by giving each session its own files |
+| L3 | **Responsibility Split** | Designate a single writer per file category |
+
+Use all three together for maximum safety. Use L1 alone as a quick fix.
+
+---
+
+## 4. Solution 1 — File Locking
+
+### 4.1 Concept
+
+Before writing a shared file, acquire an exclusive lock. Other writers block until the lock is released. This serializes writes without data loss.
+
+### 4.2 Implementation
+
+```python
+# tools/file_lock_write.py
+"""
+Atomic file writer with advisory locking.
+Usage:
+    python file_lock_write.py <path> <content> [--mode append|overwrite]
+"""
+
+import fcntl
+import os
+import sys
+import argparse
+import time
+from pathlib import Path
+
+
+def locked_write(file_path: str, content: str, mode: str = "append") -> None:
+    """
+    Write content to a file under an exclusive advisory lock.
+
+    Args:
+        file_path: Target file path (created if it does not exist).
+        content:   Text to write.
+        mode:      "append" adds to the end; "overwrite" replaces all content.
+    """
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lock_path = path.with_suffix(path.suffix + ".lock")
+
+    with open(lock_path, "w") as lock_file:
+        try:
+            for attempt in range(10):
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if attempt == 9:
+                        raise TimeoutError(
+                            f"Could not acquire lock on {file_path} after 10 attempts"
+                        )
+                    time.sleep(0.1 * (attempt + 1))
+
+            open_mode = "a" if mode == "append" else "w"
+            with open(file_path, open_mode, encoding="utf-8") as f:
+                f.write(content)
+
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Write a file with exclusive locking.")
+    parser.add_argument("path", help="Target file path")
+    parser.add_argument("content", help="Content to write")
+    parser.add_argument(
+        "--mode",
+        choices=["append", "overwrite"],
+        default="append",
+        help="Write mode (default: append)",
+    )
+    args = parser.parse_args()
+
+    locked_write(args.path, args.content, args.mode)
+    print(f"[ok] wrote to {args.path} (mode={args.mode})")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 4.3 Usage
 
 ```bash
-# Correct — uses exclusive file lock
-python3 tools/file_lock_write.py memory/2026-03-15.md "- 14:00 Task completed" --mode append
+# Append a log entry
+python tools/file_lock_write.py memory/2026-03-15.md "- 14:00 Task completed\n" --mode append
 
-# Wrong — race condition risk
-echo "- 14:00 Task completed" >> memory/2026-03-15.md
+# Overwrite a state file
+python tools/file_lock_write.py state/current.json '{"status": "idle"}' --mode overwrite
 ```
 
-The `fcntl.LOCK_EX` call acquires an exclusive lock. If another process already holds the lock, the caller blocks until it is released. This guarantees that only one session writes at a time. The `finally` block ensures the lock is always released, even if the write raises an exception.
+```python
+from tools.file_lock_write import locked_write
 
-## Path Separation Strategy
-
-File locking solves corruption but does not solve readability. When both sessions append to the same daily log, the entries interleave in ways that are hard to follow. An optional upgrade is to separate write paths by session type:
-
-- DM writes to: `memory/dm-YYYY-MM-DD.md`
-- Group chat writes to: `memory/group-YYYY-MM-DD.md`
-- A nightly merge job (e.g., 22:00) combines both into: `memory/YYYY-MM-DD.md`
-
-With path separation, file locking is still recommended (a single session could theoretically race with itself on rapid successive calls), but the contention window drops to near zero.
-
-Here is the merge script:
-
-```bash
-#!/bin/bash
-# Nightly merge of session-specific logs into unified daily log
-DATE=$(date +%Y-%m-%d)
-MEMORY_DIR="memory"
-MERGED="${MEMORY_DIR}/${DATE}.md"
-
-echo "# ${DATE}" > "${MERGED}"
-echo "" >> "${MERGED}"
-
-if [ -f "${MEMORY_DIR}/dm-${DATE}.md" ]; then
-    echo "## DM Session" >> "${MERGED}"
-    cat "${MEMORY_DIR}/dm-${DATE}.md" >> "${MERGED}"
-    echo "" >> "${MERGED}"
-fi
-
-if [ -f "${MEMORY_DIR}/group-${DATE}.md" ]; then
-    echo "## Group Session" >> "${MERGED}"
-    cat "${MEMORY_DIR}/group-${DATE}.md" >> "${MERGED}"
-    echo "" >> "${MERGED}"
-fi
-
-# Archive session-specific files
-mkdir -p "${MEMORY_DIR}/archive"
-[ -f "${MEMORY_DIR}/dm-${DATE}.md" ] && mv "${MEMORY_DIR}/dm-${DATE}.md" "${MEMORY_DIR}/archive/"
-[ -f "${MEMORY_DIR}/group-${DATE}.md" ] && mv "${MEMORY_DIR}/group-${DATE}.md" "${MEMORY_DIR}/archive/"
+locked_write("memory/2026-03-15.md", "- 15:00 Agent B finished analysis\n")
 ```
 
-Schedule this with cron or your preferred task runner. The merged file becomes the single source of truth for that day's activity.
+### 4.4 How It Works
 
-## Cross-Session Information Sync
+```
+Session A                        Session B
+─────────                        ─────────
+open("today.md.lock")            open("today.md.lock")
+flock(LOCK_EX) ✓ acquired        flock(LOCK_EX) … blocked …
+write("- Event B\n")
+flock(LOCK_UN)
+                                 … unblocked → LOCK_EX ✓ acquired
+                                 write("- Event C\n")
+                                 flock(LOCK_UN)
+```
 
-Sessions cannot see each other's conversation history. The DM session has zero visibility into what was said in the group chat, and vice versa. The ONLY reliable bridge between sessions is the filesystem.
+Both events are preserved, in arrival order.
 
-This means three things in practice:
+### 4.5 Limitations
 
-**Before starting a task**, read relevant memory files to check if the other session has context. Maybe the group chat already discussed requirements. Maybe the DM session already completed half the work. The memory files are the only way to know.
+- `fcntl.flock` is advisory: uncooperative writers that skip locking are not blocked.
+- Does not work across network filesystems (NFS, SMB). Use Redis `SET NX` or etcd for distributed deployments.
+- Lock files (`.lock`) accumulate — add a cleanup step or use `tmp` directories.
 
-**After completing a task**, write results to memory files immediately. Do not wait for the conversation to end. Do not assume someone will ask for a status update. The write happens as part of task completion, not as a follow-up.
+---
 
-**When switching context between sessions**, always re-brief with full context. Never assume continuity.
+## 5. Solution 2 — Path Separation
 
-Here are the anti-patterns that cause the most confusion:
+### 5.1 Concept
 
-- "Continue working on that thing" — the other session has no idea what "that" refers to. Instead: "Continue the security audit — last completed step was scanning agent definitions, 50 of 154 done."
-- Assuming the DM session knows what was discussed in group chat — it does not. Instead: write a summary to `memory/` after important group discussions so any session can read it.
-- Relying on conversation memory for task state — conversation memory is session-scoped and ephemeral. Task progress must live in files.
+Eliminate sharing entirely by giving each session its own write path. Merge later during a quiet window.
 
-## Operator Best Practices
+### 5.2 Directory Layout
 
-The human working with a multi-session AI employee should follow these guidelines:
+```
+memory/
+├── dm-2026-03-15.md         ← written only by direct-message session
+├── group-2026-03-15.md      ← written only by group-chat session
+├── agent-task-2026-03-15.md ← written only by task-runner session
+└── 2026-03-15.md            ← merged nightly, read-only during the day
+```
 
-**One window, one responsibility.** Use the DM for task execution. Use the group chat for coordination and status. Do not mix them. If you start assigning tasks in the group chat, you lose the clean division of labor and increase the chance of write conflicts.
+### 5.3 Session → Path Mapping
 
-**Do not fire multiple tasks in rapid succession.** Send a task, wait for acknowledgment, then send the next one. The AI employee executes sequentially within a session — sending three tasks at once does not make them run in parallel, it just makes the queue harder to track.
+```python
+# tools/session_path.py
 
-**Use explicit status triggers.** Say "current status" or "task list" to get a status report. The AI reads memory files to construct its answer, so the report reflects all sessions' work, not just the current conversation.
+from datetime import date
+from enum import Enum
 
-**Task progress lives in files, not in conversation memory.** If you close the chat window and reopen it, the AI should be able to reconstruct full context from the filesystem alone. If it cannot, your logging discipline has a gap.
 
-## Execution Rules for the AI Employee
+class SessionType(Enum):
+    DIRECT_MESSAGE = "dm"
+    GROUP_CHAT     = "group"
+    TASK_RUNNER    = "agent-task"
+    ORCHESTRATOR   = "orchestrator"
 
-These are the rules that the AI employee itself must follow in a multi-session environment:
 
-1. **Receive task** — immediately log to the daily file. The log entry includes the task description, who assigned it, and the timestamp.
-2. **Long task starting** — announce "Working on X, estimated ~Y minutes" so the operator knows the session is occupied.
-3. **Task complete** — report the result in conversation AND update the daily log. Both must happen. The conversation report is for the operator's immediate awareness; the log entry is for cross-session visibility.
-4. **Cross-session information** — ONLY through `memory/` files. Never rely on conversation memory for anything that another session might need to know.
-5. **Sequential execution** — each session executes strictly one task at a time. No parallel tasks within a single session. If a new task arrives while one is in progress, acknowledge it and queue it, but do not interrupt the current work.
+def daily_log_path(session_type: SessionType, base_dir: str = "memory") -> str:
+    today = date.today().strftime("%Y-%m-%d")
+    return f"{base_dir}/{session_type.value}-{today}.md"
+```
 
-These rules are simple but they require discipline. The most common failure mode is not a technical bug — it is skipping the log write because the task felt too small to record. Every task gets logged. No exceptions.
+### 5.4 Nightly Merge Script
+
+```python
+# tools/merge_daily_logs.py
+
+import glob
+import os
+from datetime import date
+from pathlib import Path
+from file_lock_write import locked_write
+
+
+def merge_logs(base_dir: str = "memory") -> None:
+    today = date.today().strftime("%Y-%m-%d")
+    output_path = f"{base_dir}/{today}.md"
+    pattern = f"{base_dir}/*-{today}.md"
+
+    fragments = sorted(glob.glob(pattern))
+    if not fragments:
+        return
+
+    lines = [f"# {today}\n\n"]
+    for fragment in fragments:
+        session_label = Path(fragment).stem.replace(f"-{today}", "")
+        lines.append(f"## [{session_label}]\n")
+        with open(fragment, encoding="utf-8") as f:
+            lines.append(f.read().strip())
+        lines.append("\n\n")
+
+    locked_write(output_path, "".join(lines), mode="overwrite")
+
+    archive_dir = Path(base_dir) / "archive"
+    archive_dir.mkdir(exist_ok=True)
+    for fragment in fragments:
+        os.rename(fragment, archive_dir / Path(fragment).name)
+
+
+if __name__ == "__main__":
+    merge_logs()
+```
+
+---
+
+## 6. Solution 3 — Role-Based Responsibility Split
+
+### 6.1 Concept
+
+Assign exclusive write ownership of each file category to a single session type. No two session types should ever write the same file.
+
+### 6.2 Ownership Table
+
+| File | Owner | Others |
+|------|-------|--------|
+| `memory/YYYY-MM-DD.md` | Group-chat session (coordinator) | Read-only |
+| `memory/MEMORY.md` | Group-chat session (coordinator) | Read-only |
+| `state/tasks.json` | Orchestrator session | Read-only |
+| `output/<task-id>.md` | Task-runner session (per task) | Read-only |
+| `tmp/<session-id>/` | Each session (private) | No access |
+
+### 6.3 Enforcement via Write Guard
+
+```python
+# tools/write_guard.py
+
+WRITE_OWNERSHIP = {
+    "memory/MEMORY.md":   "group",
+    "state/tasks.json":   "orchestrator",
+}
+
+WRITE_PATTERNS = [
+    ("memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md", "group"),
+    ("output/*.md", "task-runner"),
+]
+
+import fnmatch
+
+
+def assert_write_allowed(file_path: str, session_type: str) -> None:
+    if file_path in WRITE_OWNERSHIP:
+        owner = WRITE_OWNERSHIP[file_path]
+        if session_type != owner:
+            raise PermissionError(
+                f"Session '{session_type}' cannot write '{file_path}'. Owner: '{owner}'"
+            )
+        return
+
+    for pattern, owner in WRITE_PATTERNS:
+        if fnmatch.fnmatch(file_path, pattern):
+            if session_type != owner:
+                raise PermissionError(
+                    f"Session '{session_type}' cannot write '{file_path}'. "
+                    f"Pattern '{pattern}' is owned by '{owner}'"
+                )
+            return
+```
+
+---
+
+## 7. Putting It Together
+
+```python
+# agent/memory_writer.py
+
+from tools.write_guard import assert_write_allowed
+from tools.file_lock_write import locked_write
+from tools.session_path import daily_log_path, SessionType
+from datetime import datetime
+
+
+class MemoryWriter:
+    def __init__(self, session_type: SessionType):
+        self.session_type = session_type
+
+    def log(self, message: str) -> None:
+        """Append a timestamped entry to this session's daily log."""
+        path = daily_log_path(self.session_type)          # L2: path separation
+        assert_write_allowed(path, self.session_type.value)  # L3: ownership check
+        ts = datetime.now().strftime("%H:%M")
+        locked_write(path, f"- {ts} {message}\n")         # L1: file locking
+
+    def update_long_term_memory(self, content: str) -> None:
+        """Update MEMORY.md — only allowed for the group session."""
+        path = "memory/MEMORY.md"
+        assert_write_allowed(path, self.session_type.value)  # raises if not group
+        locked_write(path, content, mode="overwrite")
+
+
+# Usage
+writer = MemoryWriter(SessionType.DIRECT_MESSAGE)
+writer.log("Completed user onboarding task")
+# → writes to memory/dm-2026-03-15.md with file lock
+```
+
+---
+
+## 8. Common Mistakes
+
+| Mistake | Consequence | Fix |
+|---------|-------------|-----|
+| Writing shared files without a lock | Silent data loss under concurrent load | Always use `locked_write` for shared files |
+| Using the same daily log path in all sessions | Guaranteed race conditions at scale | Apply path separation from day one |
+| Assuming sequential execution | Works in dev, breaks in production when parallelism increases | Design for concurrency, not against it |
+| Forgetting to release locks on exception | Deadlock — all writers block forever | Use `try/finally` or context managers to guarantee unlock |
+| Locking the data file directly | File corruption if the write fails mid-way | Lock a separate `.lock` file; write to data file only after lock is held |
+| Skipping write guard in sub-agents | Sub-agents silently overwrite coordinator's files | Enforce `assert_write_allowed` in every agent's write path |
+
+---
+
+## 9. Quick Reference
+
+```
+Problem:   Two agents write the same file → one write is lost (silent)
+Root cause: read-modify-write is not atomic; no built-in coordination
+
+Fix L1 — File Locking
+  locked_write(path, content)           # serialize with fcntl.flock
+
+Fix L2 — Path Separation
+  daily_log_path(SessionType.DM)        # → memory/dm-YYYY-MM-DD.md
+  merge_logs()                          # nightly merge to canonical file
+
+Fix L3 — Responsibility Split
+  assert_write_allowed(path, session)   # raises if wrong session writes
+  WRITE_OWNERSHIP = { "memory/MEMORY.md": "group", ... }
+
+Combined usage:
+  1. assert_write_allowed(path, session_type)   # check ownership
+  2. locked_write(path, content)                # acquire lock, write, release
+  3. Use session-specific paths for daily logs  # no sharing = no conflict
+```
+
+---
+
+*Part of the [soul-first-agent](https://github.com/eric-wei-ai/soul-first-agent) framework — production-tested patterns for deploying AI employees in enterprise environments.*
