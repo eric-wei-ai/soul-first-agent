@@ -37,36 +37,7 @@ This table is a convention, not a technical enforcement. The enforcement comes f
 
 ## File Locking to Prevent Conflicts
 
-Any write to shared files MUST use a file lock. Here is the wrapper script that every session uses:
-
-```python
-#!/usr/bin/env python3
-"""File lock wrapper for safe concurrent writes."""
-import fcntl
-import argparse
-from pathlib import Path
-
-def locked_write(filepath: str, content: str, mode: str = "append"):
-    path = Path(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    open_mode = "a" if mode == "append" else "w"
-    with open(path, open_mode) as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-        try:
-            f.write(content)
-            if not content.endswith("\n"):
-                f.write("\n")
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("filepath")
-    parser.add_argument("content")
-    parser.add_argument("--mode", choices=["append", "overwrite"], default="append")
-    args = parser.parse_args()
-    locked_write(args.filepath, args.content, args.mode)
+Any write to shared files MUST use a file lock. See [`tools/file_lock_write.py`](../tools/file_lock_write.py) for the implementation, or the detailed explanation in [Memory System](memory-system.md#file-locking).
 ```
 
 The rule is simple: ALL writes to `memory/*.md` files MUST go through this wrapper. Direct writes are prohibited.

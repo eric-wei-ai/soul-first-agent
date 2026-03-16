@@ -34,7 +34,7 @@ Build the soul first. Everything else follows.
 
 **1. Clone this repo**
 ```bash
-git clone https://github.com/YOUR_ORG/soul-first-agent
+git clone https://github.com/eric-wei-ai/soul-first-agent
 ```
 
 **2. Copy the SOUL template**
